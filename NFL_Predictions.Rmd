@@ -1,0 +1,477 @@
+---
+title: "NFL Game Predictions & Season Simulation"
+subtitle: "Offense/defense rating model with Monte Carlo playoff odds"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    code_folding: hide
+    number_sections: false
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center")
+
+library(dplyr)
+library(tidyr)
+library(nflreadr)
+library(gt)
+library(googlesheets4)
+```
+
+# Overview
+
+Each team has an **offense rating** (points scored above an average team) and a
+**defense rating** (points prevented). Before every game the model predicts both
+teams' scores from those ratings, adjusted for home field, backup quarterbacks and
+wind. After the game, ratings move toward what actually happened, using a blend of
+the final score and offensive EPA. The rest of the current season is then simulated
+10,000 times to estimate each team's final record and playoff chances.
+
+This report tunes the model and saves its parameters to `params.csv`. The weekly
+GitHub Actions run (`update.R`) reuses those parameters, so rerun this report only
+when the model changes or once per offseason. All shared functions live in
+`R/functions.R`.
+
+Use the **Code** buttons to show or hide the R code for each step.
+
+# Setup
+
+```{r settings}
+source("R/functions.R")
+
+current       <- most_recent_season()
+seasons       <- 2015:current
+train_seasons <- 2017:2022   # 2015-16 are rating warm-up
+test_seasons  <- 2023:2025
+n_sims        <- 10000
+export_sheets <- FALSE       # TRUE to also write the dashboard tabs from this report
+
+# Table styling
+shades <- c("#f7fbff", "#c6dbef", "#6baed6", "#2171b5", "#08306b")   # light = unlikely, dark = likely
+
+nice_tbl <- function(df, title, decimals = 2, ...) {
+  df |>
+    gt(...) |>
+    tab_header(title = title) |>
+    fmt_number(columns = where(is.double), decimals = decimals) |>
+    opt_row_striping() |>
+    tab_options(table.font.size = px(13), heading.align = "left",
+                heading.title.font.weight = "bold")
+}
+
+big_tbl_options <- function(tbl) {
+  tab_options(tbl, table.font.size = px(12), heading.align = "left",
+              heading.title.font.weight = "bold")
+}
+```
+
+# Data
+
+One row per regular-season game, with each team's offensive EPA and a pregame
+backup-QB flag (a QB who started fewer than half of his team's last 4 games). EPA is
+converted to "points it was worth" with a regression fit on the training seasons
+only, so it can be blended with actual points.
+
+```{r data}
+games   <- build_games(seasons)
+p_scale <- fit_epa_scale(games, train_seasons)
+games   <- add_epa_pts(games, p_scale)
+```
+
+# Rating model
+
+## Tuning
+
+Parameters are chosen to minimize margin RMSE + total RMSE on the training seasons.
+`sd_margin` doesn't affect the ratings, so it is fit afterwards with a probit model,
+which picks the spread that gives the best win probabilities.
+
+```{r tuning}
+score_params <- function(p, seasons = train_seasons) {
+  g <- filter(run_ratings(games, p)$games, season %in% seasons, !is.na(margin))
+  sqrt(mean((g$margin - g$pred_margin)^2)) + sqrt(mean((g$total - g$pred_total)^2))
+}
+
+start <- c(k = 0.08, w = 0.78, hfa = 1.35, regress = 0.40, qb = 3.5, wind = 0.13)
+fit <- optim(start, \(x) score_params(c(as.list(x), p_scale, sd_margin = 13.5)),
+             method = "L-BFGS-B",
+             lower = c(0.01, 0, 0, 0, 0, 0),
+             upper = c(0.40, 1, 4, 1, 10, 0.5))
+p_best <- c(as.list(fit$par), p_scale)
+
+# Probit slope = 1 / sd
+res <- run_ratings(games, c(p_best, sd_margin = 13.5))
+wp_fit <- glm(home_win ~ 0 + pred_margin, family = binomial(link = "probit"),
+              data = filter(res$games, season %in% train_seasons, !is.na(margin), margin != 0))
+p_best$sd_margin <- 1 / coef(wp_fit)[[1]]
+
+res <- run_ratings(games, p_best)
+
+tibble(parameter = names(p_best), value = unlist(p_best)) |>
+  nice_tbl("Tuned parameters", decimals = 3)
+```
+
+## Current ratings
+
+```{r ratings}
+res$ratings |>
+  nice_tbl("Team ratings (points vs. average team)") |>
+  cols_label(team = "Team", off = "Offense", def = "Defense", net = "Net") |>
+  data_color(columns = net, palette = c("#b2182b", "#f7f7f7", "#2166ac"),   # red = bad, blue = good
+             domain = c(-1, 1) * max(abs(res$ratings$net)))
+```
+
+# Evaluation
+
+## Model vs. Vegas
+
+```{r evaluation}
+evaluate <- function(games, seasons, vegas_sd = 13.5) {
+  games |>
+    filter(season %in% seasons, !is.na(margin), !is.na(spread_line)) |>
+    mutate(vegas_wp = pnorm(spread_line / vegas_sd),
+           won      = home_win == 1,          # positive class = home team wins
+           pick     = home_wp  > 0.5,
+           v_pick   = vegas_wp > 0.5) |>
+    summarise(
+      log_loss        = -mean(home_win * log(home_wp)  + (1 - home_win) * log(1 - home_wp)),
+      vegas_log_loss  = -mean(home_win * log(vegas_wp) + (1 - home_win) * log(1 - vegas_wp)),
+      mae_margin      = mean(abs(margin - pred_margin)),
+      vegas_margin    = mean(abs(margin - spread_line)),
+      mae_total       = mean(abs(total - pred_total)),
+      vegas_total     = mean(abs(total - total_line)),
+      accuracy        = mean(pick == won),
+      vegas_accuracy  = mean(v_pick == won),
+      precision       = sum(pick & won) / sum(pick),
+      vegas_precision = sum(v_pick & won) / sum(v_pick),
+      recall          = sum(pick & won) / sum(won),
+      vegas_recall    = sum(v_pick & won) / sum(won)
+    )
+}
+
+eval_tbl <- bind_rows(Train = evaluate(res$games, train_seasons),
+                      Test  = evaluate(res$games, test_seasons), .id = "set")
+
+eval_tbl |>
+  select(set:vegas_total) |>
+  nice_tbl("Model vs. Vegas: probabilities and scores (lower is better)", decimals = 3) |>
+  cols_label(set = "", log_loss = "Model", vegas_log_loss = "Vegas",
+             mae_margin = "Model", vegas_margin = "Vegas",
+             mae_total = "Model", vegas_total = "Vegas") |>
+  tab_spanner("Log loss",   c(log_loss, vegas_log_loss)) |>
+  tab_spanner("Margin MAE", c(mae_margin, vegas_margin)) |>
+  tab_spanner("Total MAE",  c(mae_total, vegas_total))
+
+eval_tbl |>
+  select(set, accuracy:vegas_recall) |>
+  nice_tbl("Model vs. Vegas: picking winners (higher is better)") |>
+  fmt_percent(columns = -set, decimals = 1) |>
+  cols_label(set = "", accuracy = "Model", vegas_accuracy = "Vegas",
+             precision = "Model", vegas_precision = "Vegas",
+             recall = "Model", vegas_recall = "Vegas") |>
+  tab_spanner("Accuracy",  c(accuracy, vegas_accuracy)) |>
+  tab_spanner("Precision", c(precision, vegas_precision)) |>
+  tab_spanner("Recall",    c(recall, vegas_recall)) |>
+  tab_source_note("Precision and recall treat a home win as the positive class.")
+```
+
+## Where the model trails Vegas
+
+Gap = model error − Vegas error, in points. Rerun after any model change.
+
+```{r gap}
+res$games |>
+  filter(season %in% c(train_seasons, test_seasons), !is.na(margin), !is.na(spread_line)) |>
+  mutate(gap        = abs(margin - pred_margin) - abs(margin - spread_line),
+         week_grp   = cut(week, c(0, 4, 9, 14, 18), labels = c("1-4", "5-9", "10-14", "15-18")),
+         any_backup = if_else(home_backup | away_backup, "Backup QB", "Starters")) |>
+  summarise(n = n(), gap = mean(gap), .by = c(week_grp, any_backup)) |>
+  arrange(week_grp, desc(any_backup)) |>
+  nice_tbl("Gap to Vegas by part of season") |>
+  cols_label(week_grp = "Weeks", any_backup = "QBs", n = "Games", gap = "Gap (pts)")
+```
+
+# Season simulation
+
+## Remaining games
+
+```{r remaining}
+res$games |>
+  filter(season == current, is.na(margin)) |>
+  transmute(week = paste("Week", week), matchup = paste(away_team, "@", home_team),
+            pred_margin, spread_line, pred_total, total_line, home_wp) |>
+  nice_tbl("Predictions for remaining games", decimals = 1, groupname_col = "week") |>
+  fmt_percent(columns = home_wp, decimals = 0) |>
+  cols_label(matchup = "Game", pred_margin = "Model", spread_line = "Vegas",
+             pred_total = "Model", total_line = "Vegas", home_wp = "Home win %") |>
+  tab_spanner("Home margin", c(pred_margin, spread_line)) |>
+  tab_spanner("Total points", c(pred_total, total_line))
+```
+
+## Resting starters in the final week
+
+A team is treated as **locked** going into the final week if it is in playoff
+position and no other team in its conference is within one game of it, so no
+final-week result can change its seed. In the simulation, each locked team rests
+its starting QB with the probability below, estimated from 2015–2025 using the same
+definition. Resting applies the usual backup-QB penalty to that game only.
+
+```{r resting}
+rest_hist <- rest_history(res$games, 2015:2025)
+p_best$p_rest <- mean(rest_hist$rested, na.rm = TRUE)
+
+tibble(locked_teams = nrow(rest_hist), rested = sum(rest_hist$rested, na.rm = TRUE),
+       rest_rate = p_best$p_rest) |>
+  nice_tbl("Locked teams in the final week, 2015–2025") |>
+  fmt_percent(columns = rest_rate, decimals = 0) |>
+  cols_label(locked_teams = "Locked teams", rested = "Started a backup", rest_rate = "Rest rate")
+```
+
+## Monte Carlo
+
+Each simulation plays out the remaining games in order. Each team's score is its
+expected score plus normal noise (sd = `sd_margin` / √2, so the margin has sd
+`sd_margin`), and ratings update after every simulated game, so a hot or cold
+streak carries into later weeks. Before the final week, each simulation checks
+which teams are locked and decides which of them rest their starters.
+
+Standings use simplified tiebreakers: win %, then division record (for division
+titles) or conference record (for wild cards), then random. The NFL also uses
+head-to-head, common games and strength of victory, which this skips.
+
+```{r simulate}
+set.seed(2026)
+sim  <- simulate_rest(res, current, n_sims, p_best)
+tabs <- dashboard_tables(sim, res, current, n_sims)
+```
+
+# Results
+
+## Final record odds
+
+```{r record-table}
+rec_cols <- setdiff(names(tabs$record_odds), c("team", "avg_wins"))
+
+tabs$record_odds |>
+  gt(rowname_col = "team") |>
+  tab_header(title = "Final record odds", subtitle = paste(n_sims, "simulations")) |>
+  cols_label(avg_wins = "Avg W") |>
+  fmt_number(columns = avg_wins, decimals = 1) |>
+  fmt_percent(columns = all_of(rec_cols), decimals = 0) |>
+  sub_small_vals(columns = all_of(rec_cols), threshold = 0.01, small_pattern = "<1%") |>
+  sub_zero(columns = all_of(rec_cols), zero_text = "") |>
+  data_color(columns = all_of(rec_cols), palette = shades,
+             domain = c(0, max(tabs$record_odds[rec_cols]))) |>
+  tab_source_note("* Has a tie this season, counted as a win in the record columns.") |>
+  big_tbl_options()
+```
+
+## Playoff odds
+
+```{r playoff-table}
+pct_cols <- c("playoffs", "division", "top_seed")
+
+tabs$playoff_odds |>
+  gt(groupname_col = "conf", rowname_col = "team") |>
+  tab_header(title = "Playoff odds", subtitle = paste(n_sims, "simulations")) |>
+  cols_label(div = "Division", avg_wins = "Avg W", playoffs = "Playoffs",
+             division = "Win div", top_seed = "#1 seed") |>
+  fmt_number(columns = avg_wins, decimals = 1) |>
+  fmt_percent(columns = all_of(pct_cols), decimals = 0) |>
+  data_color(columns = all_of(pct_cols), palette = shades, domain = c(0, 1)) |>
+  opt_row_striping() |>
+  big_tbl_options()
+```
+
+## Next week's swing games
+
+How much each team's playoff odds depend on its next game: odds if it wins vs. if
+it loses, from the same simulations. Teams on a bye are not shown.
+
+```{r swing-table}
+tabs$next_week |>
+  gt(rowname_col = "team") |>
+  tab_header(title = paste("Week", tabs$run_info$next_week, "playoff swing"),
+             subtitle = paste(n_sims, "simulations")) |>
+  cols_label(game = "Game", win_prob = "Win prob.", now = "Playoffs now",
+             if_win = "If win", if_loss = "If loss", swing = "Swing") |>
+  fmt_percent(columns = c(win_prob, now, if_win, if_loss, swing), decimals = 0) |>
+  data_color(columns = swing, palette = shades, domain = c(0, max(tabs$next_week$swing))) |>
+  opt_row_striping() |>
+  big_tbl_options()
+```
+
+# Save and export
+
+Saves the tuned parameters for the weekly GitHub run. Commit `params.csv` after
+knitting. With `export_sheets <- TRUE`, this report also writes the dashboard tabs
+itself (the first time, a browser window opens to sign in to Google).
+
+```{r save}
+write_params(p_best, "params.csv")
+```
+
+```{r export, eval = export_sheets}
+gs4_auth()
+for (tab in names(tabs)) sheet_write(tabs[[tab]], ss = SHEET_URL, sheet = tab)
+```
+
+# Backtest: simulating from week 10
+
+For each of the last 10 seasons, the model is rerun as if it were the end of
+week 10: later scores are hidden, and later backup-QB starts and wind are treated
+as unknown. The rest of that season is then simulated and compared with what
+actually happened.
+
+- **Final wins:** projected wins vs. actual, compared with a simple *pace*
+  projection (current win % × games in the season).
+- **80% range:** how often the actual win total fell between the 10th and 90th
+  percentile of the simulations (should be about 80%, a bit higher because wins
+  are whole numbers).
+- **Playoff Brier score:** squared error of the playoff probabilities (lower is
+  better), compared with giving every team the league-wide playoff rate.
+
+Seasons 2017–2022 were used to tune the parameters, so their results are slightly
+optimistic. 2016 and 2023–2025 are a fully out-of-sample check.
+
+```{r backtest, cache = TRUE}
+post <- load_schedules(2016:2025) |> filter(game_type != "REG")
+made_playoffs <- distinct(bind_rows(transmute(post, season, team = fix_team(home_team)),
+                                    transmute(post, season, team = fix_team(away_team))))
+
+backtest_season <- function(s, through_week = 10, n_sims = 2000) {
+  g <- games |>
+    filter(season <= s) |>
+    mutate(future      = season == s & week > through_week,
+           home_score  = replace(home_score, future, NA),
+           away_score  = replace(away_score, future, NA),
+           home_backup = home_backup & !future,   # later QB changes weren't known yet
+           away_backup = away_backup & !future,
+           wind        = replace(wind, future, 0))
+  r        <- run_ratings(g, p_best)
+  now      <- filter(r$games, season == s, !is.na(margin))
+  gp_now   <- table(c(now$home_team, now$away_team))
+  wins_now <- season_wins(now)
+  n_games  <- if (s >= 2021) 17 else 16
+  actual   <- season_wins(filter(res$games, season == s, !is.na(margin)))
+  made     <- made_playoffs$team[made_playoffs$season == s]
+  net_now  <- setNames(r$ratings$off + r$ratings$def, r$ratings$team)
+
+  simulate_rest(r, s, n_sims, p_best)$stand |>
+    summarise(proj_wins  = mean(w + t / 2),
+              lo         = quantile(w + t / 2, 0.1),
+              hi         = quantile(w + t / 2, 0.9),
+              p_playoffs = mean(playoffs),
+              .by = team) |>
+    mutate(season      = s,
+           n_games     = n_games,
+           games_now   = as.numeric(gp_now[team]),
+           wins_now    = wins_now[team],
+           net_now     = net_now[team],
+           pace_wins   = wins_now / games_now * n_games,
+           actual_wins = actual[team],
+           made        = team %in% made)
+}
+
+set.seed(2026)
+bt <- bind_rows(lapply(2016:2025, backtest_season))
+
+score_bt <- function(d, by = character(0)) {
+  summarise(d,
+            mae_model  = mean(abs(proj_wins - actual_wins)),
+            mae_pace   = mean(abs(pace_wins - actual_wins)),
+            coverage   = mean(actual_wins >= lo & actual_wins <= hi),
+            brier      = mean((p_playoffs - made)^2),
+            brier_base = mean((mean(made) - made)^2),
+            .by = all_of(by))
+}
+
+bind_rows(mutate(score_bt(bt, "season"), season = as.character(season)),
+          mutate(score_bt(bt), season = "All")) |>
+  nice_tbl("Backtest from week 10, by season", decimals = 2) |>
+  fmt_percent(columns = coverage, decimals = 0) |>
+  cols_label(season = "Season", mae_model = "Model", mae_pace = "Pace",
+             coverage = "80% range hit", brier = "Model", brier_base = "Base rate") |>
+  tab_spanner("Final wins (MAE)", c(mae_model, mae_pace)) |>
+  tab_spanner("Playoff Brier", c(brier, brier_base)) |>
+  tab_style(style = cell_text(weight = "bold"), locations = cells_body(rows = season == "All"))
+```
+
+Are the playoff probabilities themselves trustworthy? Teams are grouped by their
+week-10 playoff odds and compared with how often they actually got in.
+
+```{r backtest-calibration}
+bt |>
+  mutate(bin = cut(p_playoffs, c(0, 0.1, 0.3, 0.5, 0.7, 0.9, 1), include.lowest = TRUE)) |>
+  summarise(teams = n(), predicted = mean(p_playoffs), actual = mean(made), .by = bin) |>
+  arrange(bin) |>
+  nice_tbl("Week-10 playoff odds vs. actual playoff rate") |>
+  fmt_percent(columns = c(predicted, actual), decimals = 0) |>
+  cols_label(bin = "Playoff odds", teams = "Teams", predicted = "Predicted", actual = "Actually made it")
+```
+
+### Bubble teams (30–70% at week 10)
+
+Each bubble team is classified by whether its record at week 10 was better or worse
+than its rating suggests (rating converted to a win % against an average team), and
+by which way the model leaned. Comparing projected and actual win % over the rest of
+the season shows whether misses came from the ratings (teams played differently than
+expected) or from the playoff race itself (same wins, different outcome).
+
+```{r bubble}
+bubble <- bt |>
+  filter(p_playoffs > 0.3, p_playoffs <= 0.7) |>
+  mutate(rec_pct     = wins_now / games_now,
+         rating_pct  = pnorm(net_now / p_best$sd_margin),
+         type        = if_else(rec_pct > rating_pct, "Record better than rating",
+                                                     "Rating better than record"),
+         lean        = if_else(p_playoffs > 0.5, "Leaned in (50-70%)", "Leaned out (30-50%)"),
+         rest_proj   = (proj_wins - wins_now) / (n_games - games_now),
+         rest_actual = (actual_wins - wins_now) / (n_games - games_now))
+
+bubble |>
+  summarise(teams = n(), predicted = mean(p_playoffs), made = mean(made),
+            rest_proj = mean(rest_proj), rest_actual = mean(rest_actual),
+            .by = c(lean, type)) |>
+  arrange(lean, type) |>
+  nice_tbl("Bubble teams by type", groupname_col = "lean") |>
+  fmt_percent(columns = -c(type, teams), decimals = 0) |>
+  cols_label(type = "", teams = "Teams", predicted = "Predicted", made = "Made it",
+             rest_proj = "Projected", rest_actual = "Actual") |>
+  tab_spanner("Playoffs", c(predicted, made)) |>
+  tab_spanner("Win % after week 10", c(rest_proj, rest_actual))
+
+bubble |>
+  arrange(desc(p_playoffs)) |>
+  transmute(season = as.character(season), team,
+            record = paste(wins_now, games_now - wins_now, sep = "-"),
+            net_now, type, p_playoffs, proj_wins, actual_wins, made = if_else(made, "Yes", "No")) |>
+  nice_tbl("Every bubble team", decimals = 1) |>
+  fmt_percent(columns = p_playoffs, decimals = 0) |>
+  cols_label(season = "Season", team = "Team", record = "Week-10 record", net_now = "Net rating",
+             type = "", p_playoffs = "Playoff odds", proj_wins = "Proj. wins",
+             actual_wins = "Actual wins", made = "Made it") |>
+  data_color(columns = made, palette = c("#f4a582", "#92c5de"))
+```
+
+
+# Appendix: ideas tested
+
+| Status | Idea | Result |
+|---|---|---|
+| Kept | Backup QB penalty | About 4 points of margin; cut the late-season gap to Vegas in half |
+| Kept | Backup flag based on the last 4 games | New permanent starters stop counting as backups; better log loss on train and test |
+| Kept | Resting starters (simulation only) | Locked playoff teams rest their QB in the final week at the historical rate |
+| Kept | Wind | About −0.26 total points per mph |
+| Rejected | Rest days, division games, dome, temperature | No effect |
+| Rejected | Ahead on both O and D, balanced vs. lopsided edges, specialist vs. well-rounded teams | Made test-season predictions worse |
+| Rejected | Extra volatility for lopsided teams | No effect |
+| Parked | Special teams EPA rating | Coefficient 0.43, p = 0.04; small and uncertain |
+| Parked | Separate update speed and regression for O and D | Not yet tested |
+| Parked | Blend win-loss record into ratings | Backtest: record coefficient +0.18, p = 0.06; small |
+| Parked | Larger backup penalty in weeks 15–18 | Late-season backup games still trail Vegas by about 0.75 points |

@@ -1,0 +1,11 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+# Never commit credentials
+*.json
+
+# Knit output
+*_cache/
+*_files/
+NFL_Predictions.html
