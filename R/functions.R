@@ -2,7 +2,7 @@
 # Used by NFL_Predictions.Rmd (full report) and update.R (weekly run).
 # Requires dplyr, tidyr and nflreadr to be loaded before sourcing.
 
-SHEET_URL <- "PASTE-YOUR-SHEET-URL-HERE"   # the "NFL Playoffs" Google Sheet
+SHEET_URL <- "https://docs.google.com/spreadsheets/d/1TZWoCWfkL4TMYdyU3FMrlaGYjZBmDaOmvcRrRW1dUxQ/edit?gid=0#gid=0"   # the "NFL Playoffs" Google Sheet
 
 
 # Teams ------------------------------------------------------------------------
