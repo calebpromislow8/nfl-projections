@@ -318,7 +318,8 @@ write_params(p_best, "params.csv")
 
 ```{r export, eval = export_sheets}
 gs4_auth()
-for (tab in names(tabs)) sheet_write(tabs[[tab]], ss = SHEET_URL, sheet = tab)
+all_tabs <- c(tabs, scenario_tables(sim, res, current, n_sims))
+for (tab in names(all_tabs)) sheet_write(all_tabs[[tab]], ss = SHEET_URL, sheet = tab)
 ```
 
 # Backtest: simulating from week 10

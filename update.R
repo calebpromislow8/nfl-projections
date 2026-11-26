@@ -25,7 +25,8 @@ if (!any(res$games$season == season & is.na(res$games$margin))) {
 
 set.seed(as.integer(Sys.Date()))
 sim  <- simulate_rest(res, season, n_sims, p)
-tabs <- dashboard_tables(sim, res, season, n_sims)
+tabs <- c(dashboard_tables(sim, res, season, n_sims),
+          scenario_tables(sim, res, season, n_sims))
 
 # Service account key on GitHub Actions; browser sign-in when run locally
 key <- Sys.getenv("GCP_SA_KEY_PATH")

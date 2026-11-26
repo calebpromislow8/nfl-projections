@@ -2,7 +2,7 @@
 # Used by NFL_Predictions.Rmd (full report) and update.R (weekly run).
 # Requires dplyr, tidyr and nflreadr to be loaded before sourcing.
 
-SHEET_URL <- "https://docs.google.com/spreadsheets/d/1TZWoCWfkL4TMYdyU3FMrlaGYjZBmDaOmvcRrRW1dUxQ/edit?gid=0#gid=0"   # the "NFL Playoffs" Google Sheet
+SHEET_URL <- "PASTE-YOUR-SHEET-URL-HERE"   # the "NFL Playoffs" Google Sheet
 
 
 # Teams ------------------------------------------------------------------------
@@ -325,4 +325,47 @@ dashboard_tables <- function(sim, r, s, n_sims) {
 
   list(playoff_odds = playoff_odds, record_odds = record_odds,
        next_week = next_week, run_info = run_info)
+}
+
+
+# Scenario data ----------------------------------------------------------------
+
+# Extra tabs for the dashboard's games and "what if" tools:
+#   teams: current record and games in the season, in the order used by `sims`
+#   games: every game this season with model predictions; sim_idx numbers the
+#          unplayed games in the order they appear in `sims$results`
+#   sims:  one text row per simulation (results of every unplayed game, final
+#          wins and playoff seed for every team). Strings start with "x" so
+#          Sheets keeps them as text.
+scenario_tables <- function(sim, r, s, n_sims) {
+  team_order <- sort(teams$team)
+  season_g   <- filter(r$games, season == s)
+  played     <- filter(season_g, !is.na(margin))
+  n_games    <- table(c(season_g$home_team, season_g$away_team))
+
+  teams_tab <- teams |>
+    arrange(team) |>
+    left_join(select(tally(mutate(played, home_res = home_win)), team, w, l, t), by = "team") |>
+    mutate(across(c(w, l, t), \(x) coalesce(as.integer(x), 0L)),
+           n_games = as.integer(n_games[team]))
+
+  games_tab <- season_g |>
+    mutate(sim_idx   = if_else(is.na(margin), cumsum(is.na(margin)), NA_integer_),
+           pred_home = (pred_total + pred_margin) / 2,
+           pred_away = (pred_total - pred_margin) / 2) |>
+    select(week, gameday, away_team, home_team, away_score, home_score,
+           pred_away, pred_home, home_wp, spread_line, total_line, sim_idx)
+
+  # One character per team: final wins in base 36 (0-9, a-h) and seed (0 = missed)
+  st     <- arrange(sim$stand, sim, match(team, team_order))
+  digits <- c(0:9, letters)
+  encode <- \(v) paste0("x", apply(matrix(digits[v + 1], nrow = length(team_order)), 2, paste, collapse = ""))
+
+  sims_tab <- tibble(
+    results = paste0("x", apply(matrix(as.integer(sim$games$home_res), ncol = n_sims), 2, paste, collapse = "")),
+    wins    = encode(st$w),
+    seeds   = encode(if_else(st$playoffs, st$seed, 0L))
+  )
+
+  list(teams = teams_tab, games = games_tab, sims = sims_tab)
 }
